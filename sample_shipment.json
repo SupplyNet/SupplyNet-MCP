@@ -1,0 +1,27 @@
+{
+  "shipment_id": "uuid-1234-5678",
+  "priority": "MEDIUM",
+  "constraints": {
+    "gvw_kg": 25000,
+    "axle_count": 2,
+    "height_m": 0,
+    "width_m": 0
+  },
+  "origin": {
+    "lat": 30.7046,
+    "lon": 76.801,
+    "pin": "160002",
+    "name": "Chandigarh"
+  },
+  "destination": {
+    "lat": 17.6868,
+    "lon": 83.2185,
+    "pin": "530001",
+    "name": "Visakhapatnam"
+  },
+  "cargo": {
+    "type": "Industrial Machinery",
+    "weight_kg": 12500,
+    "value": 1850000
+  }
+}

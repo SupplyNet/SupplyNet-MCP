@@ -1,0 +1,32 @@
+{
+  "mcpServers": {
+    "news": {
+      "command": "python",
+      "args": [
+        "-m",
+        "supplynet_mcp.news_server"
+      ]
+    },
+    "weather": {
+      "command": "python",
+      "args": [
+        "-m",
+        "supplynet_mcp.weather_server"
+      ]
+    },
+    "toll": {
+      "command": "python",
+      "args": [
+        "-m",
+        "supplynet_mcp.toll_rag_server"
+      ]
+    },
+    "osrm": {
+      "command": "python",
+      "args": [
+        "-m",
+        "supplynet_mcp.osrm_server"
+      ]
+    }
+  }
+}

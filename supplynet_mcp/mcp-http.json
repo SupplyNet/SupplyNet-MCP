@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "news": {
+      "url": "http://localhost:8001/mcp"
+    },
+    "weather": {
+      "url": "http://localhost:8002/mcp"
+    },
+    "toll": {
+      "url": "http://localhost:8003/mcp"
+    },
+    "osrm": {
+      "url": "http://localhost:8004/mcp"
+    }
+  }
+}
