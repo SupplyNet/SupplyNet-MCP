@@ -24,6 +24,7 @@ If the weather provider is unavailable, the server reports
 "unavailable" instead of inventing clear weather.
 """
 
+import asyncio
 import os
 import time
 
@@ -50,6 +51,8 @@ mcp = FastMCP("SupplyNetWeatherServer")
 GEOCODING_URL = (
     "https://geocoding-api.open-meteo.com/v1/search"
 )
+
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
 WEATHER_URL = (
     "https://api.open-meteo.com/v1/forecast"
@@ -153,70 +156,57 @@ def _get_client():
 async def geocode_location(
     location: str,
 ):
+    """Resolve a route checkpoint without requiring it to be in corridor.py.
 
-    location = (
-        location or ""
-    ).strip()
-
+    Order: SupplyNet known table -> Open-Meteo geocoder -> Nominatim.
+    """
+    location = (location or "").strip()
     if not location:
-        raise ToolError(
-            "location must not be empty."
-        )
+        raise ToolError("location must not be empty.")
 
     known = cor.lookup(location)
-
     if known:
+        return cor.display_name(location), known[0], known[1]
 
-        return (
-            cor.display_name(location),
-            known[0],
-            known[1],
-        )
-
+    # Open-Meteo geocoder
     try:
-
         response = await _get_client().get(
             GEOCODING_URL,
-            params={
-                "name": location,
-                "count": 1,
-                "language": "en",
-                "format": "json",
-            },
+            params={"name": location, "count": 1, "language": "en", "format": "json"},
         )
-
         response.raise_for_status()
+        results = response.json().get("results", [])
+        if results:
+            result = results[0]
+            return result["name"], float(result["latitude"]), float(result["longitude"])
+    except Exception:
+        pass
 
-        data = response.json()
-
-        results = data.get(
-            "results",
-            [],
+    # Nominatim is a fallback for administrative names such as "X Tahsil"
+    # that Open-Meteo may not index.
+    try:
+        response = await _get_client().get(
+            NOMINATIM_URL,
+            params={
+                "q": f"{location}, India",
+                "format": "jsonv2",
+                "limit": 1,
+                "addressdetails": 1,
+            },
+            headers={"User-Agent": "SupplyNet-MCP-Weather/1.0"},
         )
+        response.raise_for_status()
+        hits = response.json()
+        if hits:
+            hit = hits[0]
+            addr = hit.get("address", {}) or {}
+            name = (addr.get("city") or addr.get("town") or addr.get("municipality")
+                    or addr.get("village") or addr.get("county") or hit.get("display_name", location).split(",")[0])
+            return str(name), float(hit["lat"]), float(hit["lon"])
+    except Exception:
+        pass
 
-        if not results:
-
-            raise ToolError(
-                f"Could not geocode '{location}'."
-            )
-
-        result = results[0]
-
-        return (
-            result["name"],
-            float(result["latitude"]),
-            float(result["longitude"]),
-        )
-
-    except ToolError:
-        raise
-
-    except Exception as exc:
-
-        raise ToolError(
-            f"Weather geocoding failed for "
-            f"'{location}': {exc}"
-        )
+    raise ToolError(f"Could not geocode '{location}'.")
 
 
 # -------------------------------------------------------------------
@@ -331,8 +321,7 @@ def determine_severity(
     if score >= 1:
         return "MEDIUM"
 
-    # Normal conditions are not a transport hazard.
-    return "NONE"
+    return "LOW"
 
 
 # -------------------------------------------------------------------
@@ -537,22 +526,21 @@ async def get_weather_alerts(
 async def check_route_weather_hazards(
     cities: List[str],
 ) -> dict:
-    """
-    Check current weather conditions for multiple route cities.
-
-    Returns an aggregate dictionary because the OSRM optimizer consumes
-    route-level weather observations and risk information.
-    """
+    """Check every route checkpoint independently; one bad geocode must not abort the route."""
     if not cities:
         raise ToolError("cities must not be empty.")
 
-    results = []
+    async def one(city: str):
+        try:
+            return await _get_weather(city)
+        except Exception as exc:
+            return WeatherResult(location=city, status="unavailable", error=str(exc))
 
-    for city in cities:
-        results.append(await _get_weather(city))
+    results = await asyncio.gather(*(one(city) for city in cities))
 
     observations = []
     cities_unavailable = []
+    errors = {}
 
     for result in results:
         if result.status == "success" and result.weather is not None:
@@ -569,6 +557,8 @@ async def check_route_weather_hazards(
             })
         else:
             cities_unavailable.append(result.location)
+            if result.error:
+                errors[result.location] = result.error
 
     if cities_unavailable and observations:
         status = "partial"
@@ -583,6 +573,7 @@ async def check_route_weather_hazards(
         "observations": observations,
         "cities_checked": cities,
         "cities_unavailable": cities_unavailable,
+        "errors": errors,
     }
 
 

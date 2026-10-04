@@ -1,267 +1,321 @@
-"""Toll advisory + cost MCP server (port 8003).
+"""SupplyNet Toll MCP - keyless OpenStreetMap toll lookup.
 
-What changed vs. the original:
-  * Retrieval is real TF-IDF over tokenized title/tags/content (was raw substring matching).
-  * Plazas are keyed by city explicitly, so "Gwalior" can never accidentally match the Mehgaon bypass doc.
-  * Unknown cities are reported as unmatched. No invented Rs. 200 default; totals say if they are complete.
-  * Unknown vehicle types are rejected instead of silently halving the price.
-  * compare_toll_routes answers the reroute question: what does the detour cost vs the main route?
-  * Data can be replaced without code changes via TOLL_DATA_PATH (JSON list of advisories).
+Uses live OpenStreetMap/Overpass data instead of TollGuru. The MCP searches
+for toll booths close to the actual OSRM route geometry and uses a mapped
+vehicle-specific/general `charge` tag when available.
 
-NOTE: the built-in rates are demo data. Load real NHAI figures with TOLL_DATA_PATH before relying on totals.
+Important:
+- This is NOT a guaranteed tariff API. OSM coverage and charge tags can be
+  incomplete or stale.
+- Unknown tolls are never treated as Rs. 0 with `complete=True`.
+- If a plaza is found without a usable charge, the result is marked partial
+  and `lower_bound=True`.
 """
 
-import json
 import math
 import os
 import re
-from collections import Counter
-from typing import Dict, List, Literal, Optional
+import asyncio
+from typing import Any, Dict, List, Literal, Optional
 
+import httpx
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
 
-from . import corridor as cor
+mcp = FastMCP("SupplyNet Toll MCP")
 
-mcp = FastMCP("TollRAGServer")
-
-MAX_CITIES = 25
-MAX_QUERY_LEN = 300
-VEHICLE_MULTIPLIERS: Dict[str, float] = {"hcv": 1.0, "truck": 1.0, "heavy": 1.0, "lcv": 0.5, "light": 0.5}
-
-
-# ------------------------- models & data -------------------------
-
-class TollAdvisory(BaseModel):
-    id: str
-    title: str
-    city: str                       # plaza city; normalized with corridor.normalize
-    content: str
-    cost_hcv: int = Field(ge=0)
-    tags: List[str] = Field(default_factory=list)
-
-
-class SearchHit(BaseModel):
-    advisory: TollAdvisory
-    score: float
+OVERPASS_URLS = [
+    os.getenv("OVERPASS_URL", "https://overpass-api.de/api/interpreter"),
+    "https://overpass.kumi.systems/api/interpreter",
+]
+OVERPASS_TIMEOUT = float(os.getenv("OVERPASS_TIMEOUT_SECONDS", "20"))
+ROUTE_MATCH_KM = float(os.getenv("TOLL_ROUTE_MATCH_KM", "5.0"))
+MAX_ROUTE_SAMPLES = int(os.getenv("TOLL_MAX_ROUTE_SAMPLES", "48"))
+SAMPLES_PER_QUERY = int(os.getenv("TOLL_SAMPLES_PER_QUERY", "12"))
+MAX_CONCURRENT_QUERIES = int(os.getenv("TOLL_MAX_CONCURRENT_QUERIES", "3"))
 
 
 class TollLine(BaseModel):
-    city: str
-    advisory_id: str
-    plaza: str
-    cost_rs: int
+    name: str
+    amount_rs: float
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    payment_method: Optional[str] = None
+    osm_id: Optional[str] = None
+    charge_source: Optional[str] = None
 
 
 class TollEstimate(BaseModel):
+    status: Literal["ok", "unavailable", "error"]
+    source: str
     vehicle_type: str
-    lines: List[TollLine]
-    known_total_rs: int
-    unmatched_cities: List[str]     # no plaza on file: NOT free, just unknown
-    complete: bool
+    lines: List[TollLine] = Field(default_factory=list)
+    known_total_rs: Optional[float] = None
+    complete: bool = False
+    lower_bound: bool = False
+    error: Optional[str] = None
 
 
 class TollComparison(BaseModel):
     vehicle_type: str
     main: TollEstimate
     alternate: TollEstimate
-    difference_rs: int              # alternate - main (negative = alternate is cheaper)
+    difference_rs: Optional[float] = None
     cheaper: Literal["main", "alternate", "tie", "unknown"]
     comparable: bool
     note: Optional[str] = None
 
 
-DEFAULT_ADVISORIES = [
-    TollAdvisory(id="KB-TOLL-01", title="NH-44 Gwalior - Jhansi Toll Corridor Rates", city="gwalior", cost_hcv=385,
-                 content="For 4-axle to 6-axle Heavy Commercial Vehicles (HCV/Trucks), the toll fee at Gwalior Toll Plaza "
-                         "is Rs. 385. FASTag lane 3 and 4 are operational 24/7. Cash payments incur a 100% penalty rate.",
-                 tags=["gwalior", "nh-44", "jhansi", "hcv", "truck", "rate", "fastag"]),
-    TollAdvisory(id="KB-TOLL-02", title="Mehgaon Bypass Highway Circular (State Highway 19)", city="mehgaon", cost_hcv=140,
-                 content="State Highway 19 via Mehgaon and Bhind serves as an approved commercial bypass during NH-44 "
-                         "disruptions in Gwalior. The Mehgaon toll booth charges Rs. 140 for multi-axle trucks. Road weight "
-                         "clearance is rated up to 40 metric tons.",
-                 tags=["mehgaon", "bhind", "bypass", "detour", "sh-19", "gwalior", "toll"]),
-    TollAdvisory(id="KB-TOLL-03", title="Agra - Gwalior Expressway Toll Charges", city="agra", cost_hcv=420,
-                 content="Toll rate for heavy trucks at Agra Plaza on NH-44 is Rs. 420. Dynamic tolling applies during peak "
-                         "rush hours (08:00 to 11:00 AM). Ensure minimum FASTag balance of Rs. 1,000.",
-                 tags=["agra", "gwalior", "expressway", "hcv", "truck", "fastag"]),
-    TollAdvisory(id="KB-TOLL-04", title="Nagpur Outer Ring Road Toll Advisory", city="nagpur", cost_hcv=260,
-                 content="Commercial vehicles bypassing Nagpur city center via Outer Ring Road pay a flat toll fee of Rs. 260. "
-                         "Overloaded trucks exceeding axle load limits will be turned back at weighbridge #2.",
-                 tags=["nagpur", "ring road", "weighbridge", "toll", "hcv", "truck"]),
-    TollAdvisory(id="KB-TOLL-05", title="Visakhapatnam Port Highway Toll & Entry Policy", city="visakhapatnam", cost_hcv=310,
-                 content="Port entry highway toll at Visakhapatnam for freight trucks is Rs. 310. RFID gate scanning is "
-                         "mandatory. Container trucks must present valid e-way bill documentation at checkpost.",
-                 tags=["visakhapatnam", "port", "freight", "truck", "toll", "e-way"]),
-]
+def _vehicle_type(value: str) -> str:
+    key = (value or "hcv").strip().lower()
+    aliases = {"hcv": "hcv", "truck": "hcv", "heavy": "hcv", "lcv": "lcv", "light": "lcv"}
+    if key not in aliases:
+        raise ToolError("Unsupported vehicle_type. Use hcv or lcv.")
+    return aliases[key]
 
 
-def _load_advisories() -> List[TollAdvisory]:
-    path = os.getenv("TOLL_DATA_PATH")
-    if not path:
-        return DEFAULT_ADVISORIES
-    with open(path, encoding="utf-8") as f:
-        return [TollAdvisory(**row) for row in json.load(f)]
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0088
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(max(0.0, min(1.0, a))))
 
 
-ADVISORIES: List[TollAdvisory] = _load_advisories()
-BY_CITY: Dict[str, List[TollAdvisory]] = {}
-for _a in ADVISORIES:
-    BY_CITY.setdefault(cor.normalize(_a.city), []).append(_a)
-
-
-# ------------------------- retrieval (TF-IDF) -------------------------
-
-_STOP = {"the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "at", "by", "via", "is", "are", "be", "with",
-         "what", "how", "much", "does", "do", "rs", "from", "any", "which", "that", "this", "it"}
-_SYN = {"trucks": "truck", "hcvs": "hcv", "heavy": "hcv", "vizag": "visakhapatnam", "vishakhapatnam": "visakhapatnam",
-        "fees": "fee", "rates": "rate", "charges": "toll", "charge": "toll", "tolls": "toll",
-        "detours": "detour", "bypasses": "bypass", "cost": "toll", "price": "toll"}
-
-
-def _tokens(text: str) -> List[str]:
-    out = []
-    for tok in re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)*", text.lower()):
-        for part in ([tok] + tok.split("-")) if "-" in tok else [tok]:
-            part = _SYN.get(part, part)
-            if part not in _STOP:
-                out.append(part)
-    return out
-
-
-def _build_index(docs: List[TollAdvisory]):
-    tfs: List[Counter] = []
-    for d in docs:
-        tf: Counter = Counter()
-        for t in _tokens(d.title) + _tokens(d.city):
-            tf[t] += 3
-        for tag in d.tags:
-            for t in _tokens(tag):
-                tf[t] += 2
-        for t in _tokens(d.content):
-            tf[t] += 1
-        tfs.append(tf)
-    n = len(docs)
-    df: Counter = Counter()
-    for tf in tfs:
-        df.update(tf.keys())
-    idf = {t: math.log((n + 1) / (c + 0.5)) + 1 for t, c in df.items()}
-    return tfs, idf
-
-
-_TFS, _IDF = _build_index(ADVISORIES)
-
-
-def search(query: str, top_k: int = 3) -> List[SearchHit]:
-    query = (query or "").strip()
-    if not query:
-        raise ToolError("Query must be non-empty.")
-    if len(query) > MAX_QUERY_LEN:
-        raise ToolError(f"Query too long (max {MAX_QUERY_LEN} chars).")
-    q = set(_tokens(query))
-    hits = []
-    for doc, tf in zip(ADVISORIES, _TFS):
-        score = sum(_IDF[t] * tf[t] / (tf[t] + 1.5) for t in q if t in tf)
-        if score > 0:
-            hits.append(SearchHit(advisory=doc, score=round(score, 3)))
-    hits.sort(key=lambda h: h.score, reverse=True)
-    return hits[:max(1, min(top_k, 10))]
-
-
-# ------------------------- cost logic -------------------------
-
-def _multiplier(vehicle_type: str) -> float:
-    v = (vehicle_type or "").strip().lower()
-    if v not in VEHICLE_MULTIPLIERS:
-        raise ToolError(f"Unsupported vehicle_type '{vehicle_type}'. Use one of: {', '.join(sorted(VEHICLE_MULTIPLIERS))}.")
-    return VEHICLE_MULTIPLIERS[v]
-
-
-def _estimate(route_cities: List[str], vehicle_type: str) -> TollEstimate:
-    if not route_cities:
-        raise ToolError("route_cities must not be empty.")
-    if len(route_cities) > MAX_CITIES:
-        raise ToolError(f"Too many cities (max {MAX_CITIES}).")
-    mult = _multiplier(vehicle_type)
-    lines, unmatched, seen = [], [], set()
-    for city in route_cities:
-        key = cor.normalize(city)
-        if not key or key in seen:
+def _min_route_distance_km(lat: float, lon: float, geometry: List[List[float]]) -> float:
+    # OSRM geometry is dense enough for a nearest-point route match. This is
+    # deliberately conservative; we only use it to reject unrelated tolls.
+    best = float("inf")
+    for point in geometry:
+        if len(point) < 2:
             continue
-        seen.add(key)
-        plazas = BY_CITY.get(key)
-        if not plazas:
-            unmatched.append(cor.display_name(city))
+        d = _haversine_km(lat, lon, float(point[1]), float(point[0]))
+        if d < best:
+            best = d
+    return best
+
+
+def _overpass_query_text(samples: List[List[float]]) -> str:
+    """Build a compact Overpass query around sampled route points."""
+    clauses = []
+    for point in samples:
+        lon, lat = float(point[0]), float(point[1])
+        # 5 km search radius around each actual route sample.
+        clauses.append(
+            f'node["barrier"="toll_booth"](around:5000,{lat},{lon});'
+        )
+        clauses.append(
+            f'node["highway"="toll_booth"](around:5000,{lat},{lon});'
+        )
+
+    return "[out:json][timeout:20];\n(\n" + "\n".join(clauses) + "\n);\nout body;"
+
+
+async def _overpass_query(samples: List[List[float]]):
+    query = _overpass_query_text(samples)
+    last_error = None
+
+    async with httpx.AsyncClient(
+        timeout=OVERPASS_TIMEOUT,
+        follow_redirects=True,
+    ) as client:
+        for url in OVERPASS_URLS:
+            try:
+                response = await client.post(
+                    url,
+                    data={"data": query},
+                )
+                response.raise_for_status()
+                return response.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                last_error = str(exc) or repr(exc)
+
+    raise RuntimeError(last_error or "Overpass request failed")
+
+
+async def _calculate_osm_tolls(route_geometry: List[List[float]], vehicle_type: str) -> TollEstimate:
+    vehicle = _vehicle_type(vehicle_type)
+
+    if not route_geometry or len(route_geometry) < 2:
+        return TollEstimate(
+            status="error",
+            source="OpenStreetMap/Overpass",
+            vehicle_type=vehicle,
+            error="route_geometry must contain at least two points.",
+        )
+
+    samples = _sample_route_geometry(route_geometry)
+    if not samples:
+        return TollEstimate(
+            status="error",
+            source="OpenStreetMap/Overpass",
+            vehicle_type=vehicle,
+            error="No valid route geometry points.",
+        )
+
+    # Split samples into a few compact Overpass requests.
+    groups = [
+        samples[i:i + SAMPLES_PER_QUERY]
+        for i in range(0, len(samples), SAMPLES_PER_QUERY)
+    ]
+
+    found: Dict[str, Dict[str, Any]] = {}
+    errors: List[str] = []
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_QUERIES)
+
+    async def fetch_group(group):
+        async with semaphore:
+            try:
+                return await _overpass_query(group), None
+            except Exception as exc:
+                return None, str(exc) or repr(exc) or exc.__class__.__name__
+
+    results = await asyncio.gather(*(fetch_group(group) for group in groups))
+
+    for payload, error in results:
+        if error:
+            errors.append(error)
             continue
-        for a in plazas:
-            lines.append(TollLine(city=key.title(), advisory_id=a.id, plaza=a.title,
-                                  cost_rs=int(round(a.cost_hcv * mult))))
-    return TollEstimate(vehicle_type=vehicle_type.strip().lower(), lines=lines,
-                        known_total_rs=sum(l.cost_rs for l in lines),
-                        unmatched_cities=unmatched, complete=not unmatched)
+
+        for element in payload.get("elements", []):
+            lat = element.get("lat")
+            lon = element.get("lon")
+            if lat is None or lon is None:
+                continue
+
+            if _min_route_distance_km(
+                float(lat),
+                float(lon),
+                route_geometry,
+            ) > ROUTE_MATCH_KM:
+                continue
+
+            tags = element.get("tags", {}) or {}
+            osm_key = f"node/{element.get('id')}"
+            name = (
+                tags.get("name")
+                or tags.get("ref")
+                or f"OSM toll booth {element.get('id')}"
+            )
+
+            amount, charge_source = _extract_charge(tags, vehicle)
+
+            found[osm_key] = {
+                "name": name,
+                "lat": float(lat),
+                "lon": float(lon),
+                "amount": amount,
+                "charge_source": charge_source,
+                "payment": (
+                    tags.get("payment:electronic")
+                    or tags.get("payment:fastag")
+                ),
+            }
+
+    if not found:
+        if errors:
+            return TollEstimate(
+                status="unavailable",
+                source="OpenStreetMap/Overpass",
+                vehicle_type=vehicle,
+                error="Overpass lookup failed: " + errors[0],
+            )
+
+        return TollEstimate(
+            status="ok",
+            source="OpenStreetMap/Overpass",
+            vehicle_type=vehicle,
+            lines=[],
+            known_total_rs=0.0,
+            complete=False,
+            lower_bound=True,
+            error=(
+                "No mapped toll booth was found near this route; "
+                "OSM coverage may be incomplete."
+            ),
+        )
+
+    lines = []
+    unknown_count = 0
+
+    for osm_id, item in sorted(
+        found.items(),
+        key=lambda x: x[1]["name"],
+    ):
+        amount = item["amount"]
+
+        if amount is None:
+            unknown_count += 1
+            continue
+
+        lines.append(
+            TollLine(
+                name=item["name"],
+                amount_rs=round(amount, 2),
+                latitude=item["lat"],
+                longitude=item["lon"],
+                payment_method=item["payment"],
+                osm_id=osm_id,
+                charge_source=item["charge_source"],
+            )
+        )
+
+    known_total = round(
+        sum(x.amount_rs for x in lines),
+        2,
+    )
+
+    complete = unknown_count == 0 and not errors
+
+    return TollEstimate(
+        status="ok",
+        source="OpenStreetMap/Overpass",
+        vehicle_type=vehicle,
+        lines=lines,
+        known_total_rs=known_total,
+        complete=complete,
+        lower_bound=not complete,
+        error=(
+            f"{unknown_count} mapped toll booth(s) had no usable charge tag."
+            if unknown_count
+            else (errors[0] if errors else None)
+        ),
+    )
 
 
-def render_hits(query: str, hits: List[SearchHit]) -> str:
-    if not hits:
-        return f"No toll advisories match '{query}'. Standard NHAI rates apply."
-    out = [f"=== Toll advisories for '{query}' ==="]
-    for h in hits:
-        a = h.advisory
-        out += [f"[{a.id}] {a.title} (score {h.score})", f"  {a.content}", f"  HCV toll: Rs. {a.cost_hcv}"]
+@mcp.tool()
+async def calculate_toll_cost(route_geometry: List[List[float]], vehicle_type: str = "hcv") -> TollEstimate:
+    """Estimate tolls for the exact OSRM route using live OpenStreetMap toll data."""
+    return await _calculate_osm_tolls(route_geometry, vehicle_type)
+
+
+@mcp.tool()
+async def calculate_toll_cost_summary(route_geometry: List[List[float]], vehicle_type: str = "hcv") -> str:
+    result = await _calculate_osm_tolls(route_geometry, vehicle_type)
+    if result.status != "ok":
+        return f"TOLL DATA {result.status.upper()}\nSource: {result.source}\nError: {result.error}"
+    out = [f"=== OSM TOLL ESTIMATE ({result.vehicle_type.upper()}) ===", f"Source: {result.source}"]
+    for line in result.lines:
+        out.append(f"- {line.name}: Rs. {line.amount_rs:.2f}")
+    out.append(f"Known toll total: Rs. {result.known_total_rs:.2f}")
+    out.append(f"Complete: {result.complete}")
+    if result.error:
+        out.append(f"Note: {result.error}")
     return "\n".join(out)
 
 
-def render_estimate(e: TollEstimate) -> str:
-    out = [f"=== TOLL COST ESTIMATE ({e.vehicle_type.upper()}) ==="]
-    out += [f"- {l.city} ({l.advisory_id}): Rs. {l.cost_rs}" for l in e.lines]
-    out.append(f"Known total: Rs. {e.known_total_rs}" + ("" if e.complete else "  (INCOMPLETE)"))
-    if e.unmatched_cities:
-        out.append("No plaza data for: " + ", ".join(e.unmatched_cities))
-    return "\n".join(out)
-
-
-# ------------------------- tools -------------------------
-
 @mcp.tool()
-async def search_toll_advisories(query: str, top_k: int = 3) -> List[SearchHit]:
-    """TF-IDF search over toll plaza advisories, FASTag rules and highway detour regulations."""
-    return search(query, top_k)
-
-
-@mcp.tool()
-async def search_toll_advisories_summary(query: str, top_k: int = 3) -> str:
-    """Same as search_toll_advisories but rendered as text, for display/logging only."""
-    return render_hits(query, search(query, top_k))
-
-
-@mcp.tool()
-async def calculate_toll_cost(route_cities: List[str], vehicle_type: str = "hcv") -> TollEstimate:
-    """Toll estimate for the plazas of the given cities. Cities without plaza data are listed as
-    unmatched and the result is flagged complete=false (they are unknown, not free)."""
-    return _estimate(route_cities, vehicle_type)
-
-
-@mcp.tool()
-async def calculate_toll_cost_summary(route_cities: List[str], vehicle_type: str = "hcv") -> str:
-    """Same as calculate_toll_cost but rendered as text, for display/logging only."""
-    return render_estimate(_estimate(route_cities, vehicle_type))
-
-
-@mcp.tool()
-async def compare_toll_routes(main_route_cities: List[str], alternate_route_cities: List[str],
-                              vehicle_type: str = "hcv") -> TollComparison:
-    """Compare toll cost of the main route vs a detour (e.g. NH-44 via Gwalior vs SH-19 via Mehgaon)."""
-    main = _estimate(main_route_cities, vehicle_type)
-    alt = _estimate(alternate_route_cities, vehicle_type)
-    comparable = main.complete and alt.complete
-    diff = alt.known_total_rs - main.known_total_rs
-    cheaper = "unknown" if not comparable else "tie" if diff == 0 else "alternate" if diff < 0 else "main"
-    note = None if comparable else "One or both routes have cities with no plaza data; totals are lower bounds."
-    return TollComparison(vehicle_type=main.vehicle_type, main=main, alternate=alt, difference_rs=diff,
-                          cheaper=cheaper, comparable=comparable, note=note)
+async def compare_toll_routes(main_route_geometry: List[List[float]], alternate_route_geometry: List[List[float]], vehicle_type: str = "hcv") -> TollComparison:
+    main, alternate = await _calculate_osm_tolls(main_route_geometry, vehicle_type), await _calculate_osm_tolls(alternate_route_geometry, vehicle_type)
+    comparable = main.status == "ok" and alternate.status == "ok" and main.complete and alternate.complete and main.known_total_rs is not None and alternate.known_total_rs is not None
+    if not comparable:
+        return TollComparison(vehicle_type=_vehicle_type(vehicle_type), main=main, alternate=alternate, difference_rs=None, cheaper="unknown", comparable=False, note="OSM toll data is incomplete for one or both routes; comparison is not authoritative.")
+    difference = round(alternate.known_total_rs - main.known_total_rs, 2)
+    cheaper = "tie" if difference == 0 else "alternate" if difference < 0 else "main"
+    return TollComparison(vehicle_type=_vehicle_type(vehicle_type), main=main, alternate=alternate, difference_rs=difference, cheaper=cheaper, comparable=True)
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", host=os.getenv("MCP_HOST", "127.0.0.1"),
-            port=int(os.getenv("MCP_PORT", "8003")))
+    mcp.run(transport="streamable-http", host=os.getenv("MCP_HOST", "127.0.0.1"), port=int(os.getenv("MCP_PORT", "8003")))
